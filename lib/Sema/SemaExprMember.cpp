@@ -22,6 +22,7 @@
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/ScopeInfo.h"
 #include "clang/Sema/SemaInternal.h"
+#include "llvm/Support/Debug.h"
 
 using namespace clang;
 using namespace sema;
@@ -630,7 +631,20 @@ static bool LookupMemberExprInRecord(Sema &SemaRef, LookupResult &R,
   SemaRef.LookupQualifiedName(R, DC, SS);
 
   if (!R.empty())
-    return false;
+      return false;
+  llvm::dbgs() << "SemaExprMember: name look-up failed\n";
+
+  DeclarationName OpName = SemaRef.Context.DeclarationNames.getCXXOperatorName(OO_Period);
+  DeclarationNameInfo OpInfo(OpName, SourceLocation());
+  LookupResult opPeriod(SemaRef, OpInfo, Sema::LookupMemberName);
+  SemaRef.LookupQualifiedName(opPeriod, DC, SS);
+
+  if (!opPeriod.empty()) {
+        llvm::dbgs() << "got an operator.()\n";
+        // build result to be stuck into R
+        R = opPeriod;
+        return false;
+  }
 
   DeclarationName Typo = R.getLookupName();
   SourceLocation TypoLoc = R.getNameLoc();
@@ -654,10 +668,12 @@ static bool LookupMemberExprInRecord(Sema &SemaRef, LookupResult &R,
           bool DroppedSpecifier =
               TC.WillReplaceSpecifier() &&
               Typo.getAsString() == TC.getAsString(SemaRef.getLangOpts());
+          llvm::dbgs() << "LookupMemberInRecord 1\n";
           SemaRef.diagnoseTypo(TC, SemaRef.PDiag(diag::err_no_member_suggest)
                                        << Typo << DC << DroppedSpecifier
                                        << SS.getRange());
         } else {
+            llvm::dbgs() << "LookupMemberInRecord 2\n";
           SemaRef.Diag(TypoLoc, diag::err_no_member) << Typo << DC << BaseRange;
         }
       },
@@ -676,6 +692,32 @@ static bool LookupMemberExprInRecord(Sema &SemaRef, LookupResult &R,
       Sema::CTK_ErrorRecovery, DC);
 
   return false;
+}
+
+/// A convenience routine for creating a decayed reference to a function.
+static ExprResult
+CreateFunctionRefExpr(Sema &S, FunctionDecl *Fn, NamedDecl *FoundDecl,
+                      bool HadMultipleCandidates,
+                      SourceLocation Loc = SourceLocation(), 
+                      const DeclarationNameLoc &LocInfo = DeclarationNameLoc()){
+  if (S.DiagnoseUseOfDecl(FoundDecl, Loc))
+    return ExprError(); 
+  // If FoundDecl is different from Fn (such as if one is a template
+  // and the other a specialization), make sure DiagnoseUseOfDecl is 
+  // called on both.
+  // FIXME: This would be more comprehensively addressed by modifying
+  // DiagnoseUseOfDecl to accept both the FoundDecl and the decl
+  // being used.
+  if (FoundDecl != Fn && S.DiagnoseUseOfDecl(Fn, Loc))
+    return ExprError();
+  DeclRefExpr *DRE = new (S.Context) DeclRefExpr(Fn, false, Fn->getType(),
+                                                 VK_LValue, Loc, LocInfo);
+  if (HadMultipleCandidates)
+    DRE->setHadMultipleCandidates(true);
+
+  S.MarkDeclRefReferenced(DRE);
+  return S.ImpCastExprToType(DRE, S.Context.getPointerType(DRE->getType()),
+                             CK_FunctionToPointerDecay);
 }
 
 static ExprResult LookupMemberExpr(Sema &S, LookupResult &R,
@@ -709,8 +751,56 @@ Sema::BuildMemberReferenceExpr(Expr *Base, QualType BaseType,
     if (IsArrow) RecordTy = RecordTy->getAs<PointerType>()->getPointeeType();
     if (LookupMemberExprInRecord(*this, R, nullptr,
                                  RecordTy->getAs<RecordType>(), OpLoc, IsArrow,
-                                 SS, TemplateArgs != nullptr, TE))
+                                 SS, TemplateArgs != nullptr, TE)) {
+      UnresolvedSet<16> Fns;
+      LookupOverloadedOperatorName(OO_Period, nullptr, BaseType, BaseType, Fns);
+      unsigned NumArgs = 2;
+      Expr * Args[] = { Base, Base };
+
+      ArrayRef<Expr *> ArgsArray(Args, NumArgs);
+
+      // Build an empty overload set.
+      OverloadCandidateSet CandidateSet(OpLoc, OverloadCandidateSet::CSK_Operator);
+
+      // Add the candidates from the given function set.
+      AddFunctionCandidates(Fns, ArgsArray, CandidateSet);
+
+      bool HadMultipleCandidates = (CandidateSet.size() > 1);
+
+      // Perform overload resolution.
+      OverloadCandidateSet::iterator Best;
+      switch (CandidateSet.BestViableFunction(*this, OpLoc, Best)) {
+        case OR_Success: {
+          // We found a built-in operator or an overloaded operator.
+          FunctionDecl *FnDecl = Best->Function;
+
+          if (FnDecl) {
+            // Build the actual expression node.
+            ExprResult FnExpr = CreateFunctionRefExpr(*this, FnDecl, Best->FoundDecl,
+                                                      HadMultipleCandidates, OpLoc);
+            if (FnExpr.isInvalid())
+              return ExprError();
+
+            // Determine the result type.
+            QualType ResultTy = FnDecl->getReturnType();
+            ExprValueKind VK = Expr::getValueKindForType(ResultTy);
+            ResultTy = ResultTy.getNonLValueExprType(Context);
+
+            CallExpr *TheCall =
+              new (Context) CXXOperatorCallExpr(Context, OO_Period, FnExpr.get(), ArgsArray,
+                                                ResultTy, VK, OpLoc, false);
+
+            if (CheckCallReturnType(FnDecl->getReturnType(), OpLoc, TheCall, FnDecl))
+              return ExprError();
+
+            return MaybeBindToTemporary(TheCall);
+          }
+        }
+        default:
+          break;
+      }
       return ExprError();
+    }
     if (TE)
       return TE;
 
@@ -1256,8 +1346,16 @@ static ExprResult LookupMemberExpr(Sema &S, LookupResult &R,
   if (const RecordType *RTy = BaseType->getAs<RecordType>()) {
     TypoExpr *TE = nullptr;
     if (LookupMemberExprInRecord(S, R, BaseExpr.get(), RTy,
-                                 OpLoc, IsArrow, SS, HasTemplateArgs, TE))
-      return ExprError();
+                                 OpLoc, IsArrow, SS, HasTemplateArgs, TE)) {
+        UnresolvedSet<16> Functions;
+        //S.LookupOverloadedOperatorName(OO_Period, nullptr, RecordTy, RecordTy, Functions);
+        if (Functions.empty()) {
+            llvm::dbgs() << "Functions is empty() 2\n";
+            return ExprError();
+        }
+        llvm::dbgs() << "there is an overloaded operator.() 2\n";
+        return ExprError();
+    }
 
     // Returning valid-but-null is how we indicate to the caller that
     // the lookup result was filled in. If typo correction was attempted and
