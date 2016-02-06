@@ -923,6 +923,7 @@ static Stmt::StmtClass DecodeOperatorCall(const CXXOperatorCallExpr *S,
   case OO_Array_New:
   case OO_Array_Delete:
   case OO_Arrow:
+  case OO_Period:
   case OO_Call:
   case OO_Conditional:
   case OO_Coawait:

@@ -7667,6 +7667,7 @@ OMPClause *Sema::ActOnOpenMPReductionClause(
   case OO_Comma:
   case OO_ArrowStar:
   case OO_Arrow:
+  case OO_Period:
   case OO_Call:
   case OO_Subscript:
   case OO_Conditional:
