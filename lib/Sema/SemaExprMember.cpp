@@ -683,6 +683,32 @@ static ExprResult LookupMemberExpr(Sema &S, LookupResult &R,
                                    SourceLocation OpLoc, CXXScopeSpec &SS,
                                    Decl *ObjCImpDecl, bool HasTemplateArgs);
 
+/// A convenience routine for creating a decayed reference to a function.
+static ExprResult
+CreateFunctionRefExpr(Sema &S, FunctionDecl *Fn, NamedDecl *FoundDecl,
+                      bool HadMultipleCandidates,
+                      SourceLocation Loc = SourceLocation(), 
+                      const DeclarationNameLoc &LocInfo = DeclarationNameLoc()){
+  if (S.DiagnoseUseOfDecl(FoundDecl, Loc))
+    return ExprError(); 
+  // If FoundDecl is different from Fn (such as if one is a template
+  // and the other a specialization), make sure DiagnoseUseOfDecl is 
+  // called on both.
+  // FIXME: This would be more comprehensively addressed by modifying
+  // DiagnoseUseOfDecl to accept both the FoundDecl and the decl
+  // being used.
+  if (FoundDecl != Fn && S.DiagnoseUseOfDecl(Fn, Loc))
+    return ExprError();
+  DeclRefExpr *DRE = new (S.Context) DeclRefExpr(Fn, false, Fn->getType(),
+                                                 VK_LValue, Loc, LocInfo);
+  if (HadMultipleCandidates)
+    DRE->setHadMultipleCandidates(true);
+
+  S.MarkDeclRefReferenced(DRE);
+  return S.ImpCastExprToType(DRE, S.Context.getPointerType(DRE->getType()),
+                             CK_FunctionToPointerDecay);
+}
+
 ExprResult
 Sema::BuildMemberReferenceExpr(Expr *Base, QualType BaseType,
                                SourceLocation OpLoc, bool IsArrow,
@@ -710,7 +736,57 @@ Sema::BuildMemberReferenceExpr(Expr *Base, QualType BaseType,
     if (LookupMemberExprInRecord(*this, R, nullptr,
                                  RecordTy->getAs<RecordType>(), OpLoc, IsArrow,
                                  SS, TemplateArgs != nullptr, TE))
+    {
+      UnresolvedSet<16> Fns;
+      LookupOverloadedOperatorName(OO_Period, nullptr, BaseType, BaseType, Fns);
+      unsigned NumArgs = 2;
+      Expr * Args[] = { Base, Base };
+
+      ArrayRef<Expr *> ArgsArray(Args, NumArgs);
+
+      // Build an empty overload set.
+      OverloadCandidateSet CandidateSet(OpLoc, OverloadCandidateSet::CSK_Operator);
+
+      // Add the candidates from the given function set.
+      AddFunctionCandidates(Fns, ArgsArray, CandidateSet);
+
+      bool HadMultipleCandidates = (CandidateSet.size() > 1);
+
+      // Perform overload resolution.
+      OverloadCandidateSet::iterator Best;
+      switch (CandidateSet.BestViableFunction(*this, OpLoc, Best)) {
+        case OR_Success: {
+          // We found a built-in operator or an overloaded operator.
+          FunctionDecl *FnDecl = Best->Function;
+
+          if (FnDecl) {
+            // Build the actual expression node.
+            ExprResult FnExpr = CreateFunctionRefExpr(*this, FnDecl, Best->FoundDecl,
+                                                      HadMultipleCandidates, OpLoc);
+            if (FnExpr.isInvalid())
+              return ExprError();
+
+            // Determine the result type.
+            QualType ResultTy = FnDecl->getReturnType();
+            ExprValueKind VK = Expr::getValueKindForType(ResultTy);
+            ResultTy = ResultTy.getNonLValueExprType(Context);
+
+            CallExpr *TheCall =
+              new (Context) CXXOperatorCallExpr(Context, OO_Period, FnExpr.get(), ArgsArray,
+                                                ResultTy, VK, OpLoc, false);
+
+            if (CheckCallReturnType(FnDecl->getReturnType(), OpLoc, TheCall, FnDecl))
+              return ExprError();
+
+            return MaybeBindToTemporary(TheCall);
+          }
+        }
+        default:
+          break;
+      }
       return ExprError();
+    }
+      //return BuildExprError();
     if (TE)
       return TE;
 
