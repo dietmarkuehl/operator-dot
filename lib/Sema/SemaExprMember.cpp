@@ -23,6 +23,8 @@
 #include "clang/Sema/ScopeInfo.h"
 #include "clang/Sema/SemaInternal.h"
 
+#include "llvm/Support/Debug.h"
+
 using namespace clang;
 using namespace sema;
 
@@ -728,70 +730,30 @@ Sema::BuildMemberReferenceExpr(Expr *Base, QualType BaseType,
 
   LookupResult R(*this, NameInfo, LookupMemberName);
 
+  llvm::dbgs() << "BuildMemberReferenceExpr\n";
+
   // Implicit member accesses.
   if (!Base) {
+    llvm::dbgs() << "implicit member access\n";
+
     TypoExpr *TE = nullptr;
     QualType RecordTy = BaseType;
     if (IsArrow) RecordTy = RecordTy->getAs<PointerType>()->getPointeeType();
     if (LookupMemberExprInRecord(*this, R, nullptr,
                                  RecordTy->getAs<RecordType>(), OpLoc, IsArrow,
                                  SS, TemplateArgs != nullptr, TE))
-    {
-      UnresolvedSet<16> Fns;
-      LookupOverloadedOperatorName(OO_Period, nullptr, BaseType, BaseType, Fns);
-      unsigned NumArgs = 2;
-      Expr * Args[] = { Base, Base };
-
-      ArrayRef<Expr *> ArgsArray(Args, NumArgs);
-
-      // Build an empty overload set.
-      OverloadCandidateSet CandidateSet(OpLoc, OverloadCandidateSet::CSK_Operator);
-
-      // Add the candidates from the given function set.
-      AddFunctionCandidates(Fns, ArgsArray, CandidateSet);
-
-      bool HadMultipleCandidates = (CandidateSet.size() > 1);
-
-      // Perform overload resolution.
-      OverloadCandidateSet::iterator Best;
-      switch (CandidateSet.BestViableFunction(*this, OpLoc, Best)) {
-        case OR_Success: {
-          // We found a built-in operator or an overloaded operator.
-          FunctionDecl *FnDecl = Best->Function;
-
-          if (FnDecl) {
-            // Build the actual expression node.
-            ExprResult FnExpr = CreateFunctionRefExpr(*this, FnDecl, Best->FoundDecl,
-                                                      HadMultipleCandidates, OpLoc);
-            if (FnExpr.isInvalid())
-              return ExprError();
-
-            // Determine the result type.
-            QualType ResultTy = FnDecl->getReturnType();
-            ExprValueKind VK = Expr::getValueKindForType(ResultTy);
-            ResultTy = ResultTy.getNonLValueExprType(Context);
-
-            CallExpr *TheCall =
-              new (Context) CXXOperatorCallExpr(Context, OO_Period, FnExpr.get(), ArgsArray,
-                                                ResultTy, VK, OpLoc, false);
-
-            if (CheckCallReturnType(FnDecl->getReturnType(), OpLoc, TheCall, FnDecl))
-              return ExprError();
-
-            return MaybeBindToTemporary(TheCall);
-          }
-        }
-        default:
-          break;
-      }
       return ExprError();
-    }
-      //return BuildExprError();
+
     if (TE)
+    {
+      llvm::dbgs() << "return TE\n";
       return TE;
+    }
 
   // Explicit member accesses.
   } else {
+    llvm::dbgs() << "explicit member access\n";
+
     ExprResult BaseResult = Base;
     ExprResult Result = LookupMemberExpr(
         *this, R, BaseResult, IsArrow, OpLoc, SS,
@@ -806,11 +768,103 @@ Sema::BuildMemberReferenceExpr(Expr *Base, QualType BaseType,
       return ExprError();
 
     if (Result.get())
+    {
+      if(R.empty())
+      {
+        // try overloaded operator dot
+        llvm::dbgs() << "try operator dot overloads\n";
+
+        const RecordType *RTy = BaseType->getAs<RecordType>();
+
+        DeclarationName OpName = Context.DeclarationNames.getCXXOperatorName(OO_Period);
+        LookupResult Fns(*this, OpName, OpLoc, LookupMemberName);
+        LookupQualifiedName(Fns, RTy->getDecl());
+
+        FunctionProtoType::ExtProtoInfo EPI(Context.getDefaultCallingConvention(
+                /*IsVariadic=*/false, /*IsCXXMethod=*/true));
+        EPI.HasTrailingReturn = true;
+        EPI.TypeQuals |= DeclSpec::TQ_const;
+
+     
+        QualType MethodTy =
+          Context.getFunctionType(Context.getAutoDeductType(), None, EPI);
+
+        TypeSourceInfo *MethodTyInfo = Context.getTrivialTypeSourceInfo(MethodTy);
+
+        LambdaScopeInfo LSI(Diags);
+
+        LSI.Lambda = createLambdaClosureType(SS.getRange(), MethodTyInfo,
+                                             false, LCD_None);
+
+        SmallVector<ParmVarDecl *, 8> Params;
+        //Params.push_back();
+
+        LSI.CallOperator = startLambdaDefinition(LSI.Lambda, SS.getRange(),
+                                                 MethodTyInfo, SS.getEndLoc(), Params);
+        ExprResult Lambda = BuildLambdaExpr(SS.getBeginLoc(), SS.getEndLoc(), &LSI);
+
+        unsigned NumArgs = 2;
+        Expr * Args[] = { Base, Lambda.get() };
+
+        ArrayRef<Expr *> ArgsArray(Args, NumArgs);
+
+        OverloadCandidateSet CandidateSet(OpLoc, OverloadCandidateSet::CSK_Operator);
+        for (LookupResult::iterator Oper = Fns.begin(), OperEnd = Fns.end();
+             Oper != OperEnd; ++Oper) {
+          AddMethodCandidate(Oper.getPair(), Base->getType(),
+                             Base->Classify(Context),
+                             MultiExprArg(Args+1, 1), CandidateSet,
+                             /*SuppressUserConversions=*/ false);
+        }
+
+        bool HadMultipleCandidates = (CandidateSet.size() > 1);
+
+        llvm::dbgs() << "operator dot candidates: " << CandidateSet.size();
+
+        // Perform overload resolution.
+        OverloadCandidateSet::iterator Best;
+        switch (CandidateSet.BestViableFunction(*this, OpLoc, Best)) {
+          case OR_Success: {
+            // We found a built-in operator or an overloaded operator.
+            FunctionDecl *FnDecl = Best->Function;
+
+            if (FnDecl) {
+              // Build the actual expression node.
+              ExprResult FnExpr = CreateFunctionRefExpr(*this, FnDecl, Best->FoundDecl,
+                                                        HadMultipleCandidates, OpLoc);
+              if (FnExpr.isInvalid())
+                return ExprError();
+
+              // Determine the result type.
+              QualType ResultTy = FnDecl->getReturnType();
+              ExprValueKind VK = Expr::getValueKindForType(ResultTy);
+              ResultTy = ResultTy.getNonLValueExprType(Context);
+
+              CallExpr *TheCall =
+                new (Context) CXXOperatorCallExpr(Context, OO_Period, FnExpr.get(), ArgsArray,
+                                                  ResultTy, VK, OpLoc, false);
+
+              if (CheckCallReturnType(FnDecl->getReturnType(), OpLoc, TheCall, FnDecl))
+                return ExprError();
+
+              return MaybeBindToTemporary(TheCall);
+            }
+          }
+          default:
+            break;
+        }
+        llvm::dbgs() << "got an empty result\n";
+      }
       return Result;
+    }
+
+    llvm::dbgs() << "fall through\n";
 
     // LookupMemberExpr can modify Base, and thus change BaseType
     BaseType = Base->getType();
   }
+
+
 
   return BuildMemberReferenceExpr(Base, BaseType,
                                   OpLoc, IsArrow, SS, TemplateKWLoc,
@@ -989,6 +1043,10 @@ Sema::BuildMemberReferenceExpr(Expr *BaseExpr, QualType BaseExprType,
                                const Scope *S,
                                bool SuppressQualifierCheck,
                                ActOnMemberAccessExtraArgs *ExtraArgs) {
+
+  llvm::dbgs() << "BuildMemberReferenceExpr 2\n";
+
+
   QualType BaseType = BaseExprType;
   if (IsArrow) {
     assert(BaseType->isPointerType());
@@ -1061,6 +1119,8 @@ Sema::BuildMemberReferenceExpr(Expr *BaseExpr, QualType BaseExprType,
     Diag(MemberLoc, diag::warn_cdtor_function_try_handler_mem_expr)
         << isa<CXXDestructorDecl>(FD);
 
+  llvm::dbgs() << "BuildMemberReferenceExpr2 foo\n";
+
   if (R.empty()) {
     // Rederive where we looked up.
     DeclContext *DC = (SS.isSet()
@@ -1091,6 +1151,8 @@ Sema::BuildMemberReferenceExpr(Expr *BaseExpr, QualType BaseExprType,
         return RetryExpr;
       }
     }
+
+    llvm::dbgs() << "BuildMemberReferenceExpr2 diag\n";
 
     Diag(R.getNameLoc(), diag::err_no_member)
       << MemberName << DC
@@ -1159,9 +1221,13 @@ Sema::BuildMemberReferenceExpr(Expr *BaseExpr, QualType BaseExprType,
   if (DiagnoseUseOfDecl(MemberDecl, MemberLoc))
     return ExprError();
 
+  llvm::dbgs() << "test1\n";
+
   if (FieldDecl *FD = dyn_cast<FieldDecl>(MemberDecl))
     return BuildFieldReferenceExpr(*this, BaseExpr, IsArrow, OpLoc, SS, FD,
                                    FoundDecl, MemberNameInfo);
+
+  llvm::dbgs() << "test2\n";
 
   if (MSPropertyDecl *PD = dyn_cast<MSPropertyDecl>(MemberDecl))
     return BuildMSPropertyRefExpr(*this, BaseExpr, IsArrow, SS, PD,
@@ -1203,6 +1269,8 @@ Sema::BuildMemberReferenceExpr(Expr *BaseExpr, QualType BaseExprType,
                            TemplateKWLoc, Enum, FoundDecl, MemberNameInfo,
                            Enum->getType(), VK_RValue, OK_Ordinary);
   }
+
+  llvm::dbgs() << "member not found\n";
 
   // We found something that we didn't expect. Complain.
   if (isa<TypeDecl>(MemberDecl))

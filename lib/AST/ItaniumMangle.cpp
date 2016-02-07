@@ -1747,6 +1747,8 @@ CXXNameMangler::mangleOperatorName(OverloadedOperatorKind OO, unsigned Arity) {
   case OO_ArrowStar: Out << "pm"; break;
   //              ::= pt        # ->
   case OO_Arrow: Out << "pt"; break;
+  //              ::= pe        # .
+  case OO_Period: Out << "pe"; break;
   //              ::= cl        # ()
   case OO_Call: Out << "cl"; break;
   //              ::= ix        # []
